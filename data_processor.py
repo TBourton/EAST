@@ -17,6 +17,7 @@ from shapely.geometry import Polygon
 
 import tensorflow as tf
 
+
 def get_images(data_path):
     files = []
     idx = 0
@@ -93,7 +94,8 @@ def check_and_validate_polys(FLAGS, polys, tags, size):
             continue
         if p_area > 0:
             if not FLAGS.suppress_warnings_and_error_messages:
-                print('poly in wrong direction')
+                pass
+                # print('poly in wrong direction')
             poly = poly[(0, 3, 2, 1), :]
         validated_polys.append(poly)
         validated_tags.append(tag)
@@ -360,14 +362,14 @@ def sort_rectangle(FLAGS, poly):
             if not FLAGS.suppress_warnings_and_error_messages:
                 print(angle, poly[p_lowest], poly[p_lowest_right])
         if angle/np.pi * 180 > 45:
-            # 这个点为p2 - this point is p2
+            # this point is p2
             p2_index = p_lowest
             p1_index = (p2_index - 1) % 4
             p0_index = (p2_index - 2) % 4
             p3_index = (p2_index + 1) % 4
             return poly[[p0_index, p1_index, p2_index, p3_index]], -(np.pi/2 - angle)
         else:
-            # 这个点为p3 - this point is p3
+            # this point is p3
             p3_index = p_lowest
             p0_index = (p3_index + 1) % 4
             p1_index = (p3_index + 2) % 4
@@ -570,7 +572,7 @@ def generate_rbox(FLAGS, im_size, polys, tags):
             geo_map[y, x, 3] = point_dist_to_line(p3_rect, p0_rect, point)
             # angle
             geo_map[y, x, 4] = rotate_angle
-    
+
     shrinked_poly_mask = (shrinked_poly_mask > 0).astype('uint8')
     text_region_boundary_training_mask = 1 - (orig_poly_mask - shrinked_poly_mask)
 
@@ -583,7 +585,7 @@ def all(iterable):
     return True
 
 def get_text_file(image_file):
-    txt_file = image_file.replace(os.path.basename(image_file).split('.')[1], 'txt')
+    txt_file = image_file.replace(os.path.basename(image_file).split('.')[-1], 'txt')
     txt_file_name = txt_file.split('/')[-1]
     txt_file = txt_file.replace(txt_file_name, 'gt_' + txt_file_name)
     return txt_file
@@ -640,6 +642,138 @@ def threadsafe_generator(f):
         return threadsafe_iter(f(*a, **kw))
     return g
 
+
+class DataGenerator(tf.keras.utils.Sequence):
+
+    def __init__(self, FLAGS, input_size=512, background_ratio=3./8, is_train=True, idx=None, random_scale=np.array([0.5, 1, 2.0, 3.0]), vis=False):
+
+        self.FLAGS = FLAGS
+        self.input_size = input_size
+        self.background_ratio = background_ratio
+        self.random_scale = random_scale
+        self.vis = vis
+        self.is_train = is_train
+
+        self.image_list = np.array(get_images(FLAGS.training_data_path))
+        if idx is not None:
+            self.image_list = self.image_list[idx]
+
+        print('{} training images in {}'.format(self.image_list.shape[0], self.FLAGS.training_data_path))
+        self.indexes = np.arange(0, self.image_list.shape[0])
+
+    def on_epoch_end(self):
+        np.random.shuffle(self.indexes)
+
+    def __len__(self):
+        return int(np.floor(len(self.image_list) / self.FLAGS.batch_size))
+
+    def __getitem__(self, index):
+        indexes = self.indexes[index * self.FLAGS.batch_size: (index + 1) * self.FLAGS.batch_size]
+        X, y = self.__data_generation(indexes)
+
+        return X, y
+
+    def __data_generation(self, indexes):
+        images = []
+        image_fns = []
+        score_maps = []
+        geo_maps = []
+        overly_small_text_region_training_masks = []
+        text_region_boundary_training_masks = []
+
+        for i in indexes:
+            im_fn = self.image_list[i]
+            im = cv2.imread(im_fn)
+            h, w, _ = im.shape
+            txt_fn = get_text_file(im_fn)
+            if not os.path.exists(txt_fn):
+                if not self.FLAGS.suppress_warnings_and_error_messages:
+                    print('text file {} does not exists'.format(txt_fn))
+                continue
+
+            text_polys, text_tags = load_annotation(txt_fn)
+            text_polys, text_tags = check_and_validate_polys(self.FLAGS, text_polys, text_tags, (h, w))
+
+            # random scale this image
+            rd_scale = np.random.choice(self.random_scale)
+            x_scale_variation = np.random.randint(-10, 10) / 100.
+            y_scale_variation = np.random.randint(-10, 10) / 100.
+            im = cv2.resize(im, dsize=None, fx=rd_scale + x_scale_variation, fy=rd_scale + y_scale_variation)
+            text_polys[:, :, 0] *= rd_scale + x_scale_variation
+            text_polys[:, :, 1] *= rd_scale + y_scale_variation
+
+
+            # random crop a area from image
+            if np.random.rand() < self.background_ratio:
+                # crop background
+                im, text_polys, text_tags = crop_area(self.FLAGS, im, text_polys, text_tags, crop_background=True)
+                if text_polys.shape[0] > 0:
+                    # cannot find background
+                    continue
+
+                # pad and resize image
+                im, _, _ = pad_image(im, self.FLAGS.input_size, self.is_train)
+                im = cv2.resize(im, dsize=(self.input_size, self.input_size))
+                score_map = np.zeros((self.input_size, self.input_size), dtype=np.uint8)
+                geo_map_channels = 5 if self.FLAGS.geometry == 'RBOX' else 8
+                geo_map = np.zeros((self.input_size, self.input_size, geo_map_channels), dtype=np.float32)
+                overly_small_text_region_training_mask = np.ones((self.input_size, self.input_size), dtype=np.uint8)
+                text_region_boundary_training_mask = np.ones((self.input_size, self.input_size), dtype=np.uint8)
+            else:
+                im, text_polys, text_tags = crop_area(self.FLAGS, im, text_polys, text_tags, crop_background=False)
+                if text_polys.shape[0] == 0:
+                    continue
+                h, w, _ = im.shape
+                im, shift_h, shift_w = pad_image(im, self.FLAGS.input_size, self.is_train)
+                im, text_polys = resize_image(im, text_polys, self.FLAGS.input_size, shift_h, shift_w)
+                new_h, new_w, _ = im.shape
+                score_map, geo_map, overly_small_text_region_training_mask, text_region_boundary_training_mask = generate_rbox(self.FLAGS, (new_h, new_w), text_polys, text_tags)
+
+            # text_polys = [sort_rectangle(self.FLAGS, poly)[0] for poly in text_polys]
+            if self.vis:
+                self.visualise(im, text_polys, geo_map, score_map)
+
+            im = (im / 127.5) - 1.
+            images.append(im[:, :, ::-1].astype(np.float32))
+            image_fns.append(im_fn)
+            score_maps.append(score_map[::4, ::4, np.newaxis].astype(np.float32))
+            geo_maps.append(geo_map[::4, ::4, :].astype(np.float32))
+            overly_small_text_region_training_masks.append(overly_small_text_region_training_mask[::4, ::4, np.newaxis].astype(np.float32))
+            text_region_boundary_training_masks.append(text_region_boundary_training_mask[::4, ::4, np.newaxis].astype(np.float32))
+
+        return [np.array(images), np.array(overly_small_text_region_training_masks), np.array(text_region_boundary_training_masks), np.array(score_maps)], [np.array(score_maps), np.array(geo_maps)]
+
+    def visualise(self, im, text_polys, geo_map, score_map):
+        fig, axs = plt.subplots(3, 2, figsize=(20, 30))
+        axs[0, 0].imshow(im[:, :, ::-1])
+        axs[0, 0].set_xticks([])
+        axs[0, 0].set_yticks([])
+        for poly in text_polys:
+            poly_h = min(abs(poly[3, 1] - poly[0, 1]), abs(poly[2, 1] - poly[1, 1]))
+            poly_w = min(abs(poly[1, 0] - poly[0, 0]), abs(poly[2, 0] - poly[3, 0]))
+            axs[0, 0].add_artist(Patches.Polygon(
+                poly, facecolor='none', edgecolor='green', linewidth=2, linestyle='-', fill=True))
+            axs[0, 0].text(poly[0, 0], poly[0, 1], '{:.0f}-{:.0f}'.format(poly_h, poly_w), color='purple')
+        axs[0, 1].imshow(score_map[::, ::])
+        axs[0, 1].set_xticks([])
+        axs[0, 1].set_yticks([])
+        axs[1, 0].imshow(geo_map[::, ::, 0])
+        axs[1, 0].set_xticks([])
+        axs[1, 0].set_yticks([])
+        axs[1, 1].imshow(geo_map[::, ::, 1])
+        axs[1, 1].set_xticks([])
+        axs[1, 1].set_yticks([])
+        axs[2, 0].imshow(geo_map[::, ::, 2])
+        axs[2, 0].set_xticks([])
+        axs[2, 0].set_yticks([])
+        # axs[2, 1].imshow(training_mask[::, ::])
+        # axs[2, 1].set_xticks([])
+        # axs[2, 1].set_yticks([])
+        plt.tight_layout()
+        plt.show()
+        plt.close()
+
+
 @threadsafe_generator
 def generator(FLAGS, input_size=512, background_ratio=3./8, is_train=True, idx=None, random_scale=np.array([0.5, 1, 2.0, 3.0]), vis=False):
     image_list = np.array(get_images(FLAGS.training_data_path))
@@ -662,6 +796,7 @@ def generator(FLAGS, input_size=512, background_ratio=3./8, is_train=True, idx=N
                 im_fn = image_list[i]
                 im = cv2.imread(im_fn)
                 h, w, _ = im.shape
+                print(f"height {h}, width {w}, {im_fn}")
                 txt_fn = get_text_file(im_fn)
                 if not os.path.exists(txt_fn):
                     if not FLAGS.suppress_warnings_and_error_messages:
@@ -673,7 +808,7 @@ def generator(FLAGS, input_size=512, background_ratio=3./8, is_train=True, idx=N
                 text_polys, text_tags = check_and_validate_polys(FLAGS, text_polys, text_tags, (h, w))
 
                 # random scale this image
-                rd_scale = np.random.choice(random_scale)                
+                rd_scale = np.random.choice(random_scale)
                 x_scale_variation = np.random.randint(-10, 10) / 100.
                 y_scale_variation = np.random.randint(-10, 10) / 100.
                 im = cv2.resize(im, dsize=None, fx=rd_scale + x_scale_variation, fy=rd_scale + y_scale_variation)
@@ -759,14 +894,13 @@ def generator(FLAGS, input_size=512, background_ratio=3./8, is_train=True, idx=N
         epoch += 1
 
 
-
 @threadsafe_generator
 def val_generator(FLAGS, idx=None, is_train=False):
     image_list = np.array(get_images(FLAGS.validation_data_path))
     if not idx is None:
         image_list = image_list[idx]
     print('{} validation images in {}'.format(
-        image_list.shape[0], FLAGS.training_data_path))
+        image_list.shape[0], FLAGS.validation_data_path))
     index = np.arange(0, image_list.shape[0])
     epoch = 1
     while True:
@@ -777,6 +911,7 @@ def val_generator(FLAGS, idx=None, is_train=False):
         geo_maps = []
         overly_small_text_region_training_masks = []
         text_region_boundary_training_masks = []
+        ratios = []
         for i in index:
             try:
                 im_fn = image_list[i]
@@ -789,12 +924,12 @@ def val_generator(FLAGS, idx=None, is_train=False):
                     continue
 
                 text_polys, text_tags = load_annotation(txt_fn)
-
                 text_polys, text_tags = check_and_validate_polys(FLAGS, text_polys, text_tags, (h, w))
-                
+
                 im, shift_h, shift_w = pad_image(im, FLAGS.input_size, is_train)
                 im, text_polys = resize_image(im, text_polys, FLAGS.input_size, shift_h, shift_w)
                 new_h, new_w, _ = im.shape
+                ratio_h, ratio_w = new_h / float(h), new_w / float(w)
                 score_map, geo_map, overly_small_text_region_training_mask, text_region_boundary_training_mask = generate_rbox(FLAGS, (new_h, new_w), text_polys, text_tags)
 
                 im = (im / 127.5) - 1.
@@ -804,15 +939,17 @@ def val_generator(FLAGS, idx=None, is_train=False):
                 geo_maps.append(geo_map[::4, ::4, :].astype(np.float32))
                 overly_small_text_region_training_masks.append(overly_small_text_region_training_mask[::4, ::4, np.newaxis].astype(np.float32))
                 text_region_boundary_training_masks.append(text_region_boundary_training_mask[::4, ::4, np.newaxis].astype(np.float32))
+                ratios.append([ratio_h, ratio_w])
 
                 if len(images) == FLAGS.batch_size:
-                    yield [np.array(images), np.array(overly_small_text_region_training_masks), np.array(text_region_boundary_training_masks), np.array(score_maps)], [np.array(score_maps), np.array(geo_maps)]
+                    yield [np.array(images), np.array(overly_small_text_region_training_masks), np.array(text_region_boundary_training_masks), np.array(score_maps)], [np.array(score_maps), np.array(geo_maps), np.array(ratios)]
                     images = []
                     image_fns = []
                     score_maps = []
                     geo_maps = []
                     overly_small_text_region_training_masks = []
                     text_region_boundary_training_masks = []
+                    ratios = []
             except Exception as e:
                 import traceback
                 if not FLAGS.suppress_warnings_and_error_messages:
@@ -826,6 +963,10 @@ def count_samples(FLAGS):
         return len([f for f in next(os.walk(FLAGS.training_data_path))[2] if f[-4:] == ".jpg"])
     else:
         return len([f for f in os.walk(FLAGS.training_data_path).next()[2] if f[-4:] == ".jpg"])
+
+
+def count_val_samples(FLAGS):
+    return len([f for f in next(os.walk(FLAGS.validation_data_path))[2] if f[-4:] == ".jpg"])
 
 
 def load_data_process(args):
@@ -842,10 +983,11 @@ def load_data_process(args):
         img, shift_h, shift_w = pad_image(img, FLAGS.input_size, is_train=is_train)
         img, text_polys = resize_image(img, text_polys, FLAGS.input_size, shift_h, shift_w)
         new_h, new_w, _ = img.shape
+        ratio_h, ratio_w = new_h / float(h), new_w / float(w)
         score_map, geo_map, overly_small_text_region_training_mask, text_region_boundary_training_mask = generate_rbox(FLAGS, (new_h, new_w), text_polys, text_tags)
         img = (img / 127.5) - 1.
         return img[:, :, ::-1].astype(np.float32), image_file, score_map[::4, ::4, np.newaxis].astype(np.float32), geo_map[::4, ::4, :].astype(np.float32), overly_small_text_region_training_mask[::4, ::4, np.newaxis].astype(np.float32), text_region_boundary_training_mask[::4, ::4, np.newaxis].astype(np.float32)
-    except Exception as e:
+    except Exception:
         import traceback
         if not FLAGS.suppress_warnings_and_error_messages:
             traceback.print_exc()
@@ -874,7 +1016,6 @@ def load_data(FLAGS, is_train=False):
     overly_small_text_region_training_masks = [item[4] for item in loaded_data if not item is None]
     text_region_boundary_training_masks = [item[5] for item in loaded_data if not item is None]
     print('Number of validation images : %d' % len(images))
-
 
     return np.array(images), np.array(overly_small_text_region_training_masks), np.array(text_region_boundary_training_masks), np.array(score_maps), np.array(geo_maps)
 
