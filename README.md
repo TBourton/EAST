@@ -1,7 +1,7 @@
 
 # EAST: An Efficient and Accurate Scene Text Detector
 
-This is a tesnorflow2 compatible Keras implementation of EAST based on (https://github.com/kurapan/EAST) by [kurapan].
+This is a tf2 compatible Keras implementation of EAST based on (https://github.com/kurapan/EAST) by [kurapan].
 
 The original paper by Zhou et al. is available on [arxiv](https://arxiv.org/abs/1704.03155).
 
